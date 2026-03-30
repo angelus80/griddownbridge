@@ -1,4 +1,5 @@
-﻿import os
+
+import os
 import time
 import logging
 import threading
@@ -9,6 +10,7 @@ from flask import Flask, jsonify, request
 from pubsub import pub
 
 import meshtastic.serial_interface
+from serial.tools import list_ports
 
 try:
     from meshtastic import __version__ as MESHTASTIC_VERSION
@@ -16,11 +18,11 @@ except Exception:
     MESHTASTIC_VERSION = "unknown"
 
 
-BRIDGE_VERSION = "1.3.1"
+BRIDGE_VERSION = "1.5.1"
 
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "5001"))
-SERIAL_PORT = os.getenv("MESHTASTIC_PORT", "COM3")
+SERIAL_PORT = os.getenv("MESHTASTIC_PORT", "COM5")
 
 MESSAGE_LIMIT = max(10, min(int(os.getenv("MESSAGE_LIMIT", "200")), 1000))
 DEFAULT_MESSAGES_LIMIT = 50
@@ -41,6 +43,12 @@ iface = None
 recent_messages = deque(maxlen=MESSAGE_LIMIT)
 last_error: Optional[str] = None
 last_connect_ts: Optional[int] = None
+current_serial_port: Optional[str] = None
+last_good_port: Optional[str] = os.getenv("MESHTASTIC_LAST_PORT") or None
+
+# Runtime telemetry learned from packets. This helps when iface.nodes lacks
+# fresh lastHeard / signal values.
+node_runtime: dict[str, dict[str, Any]] = {}
 
 
 def now_ts() -> int:
@@ -80,25 +88,113 @@ def is_connected() -> bool:
     return get_interface() is not None
 
 
-def connect_interface() -> bool:
+def scan_serial_ports() -> list[str]:
+    ports = []
+    try:
+        for p in list_ports.comports():
+            dev = getattr(p, "device", None)
+            if dev:
+                ports.append(str(dev))
+    except Exception:
+        pass
+
+    seen = set()
+    ordered = []
+    for p in ports:
+        key = p.upper()
+        if key not in seen:
+            seen.add(key)
+            ordered.append(p)
+    return ordered
+
+
+def _set_current_port(port_name: Optional[str]) -> None:
+    global current_serial_port, last_good_port
+    with state_lock:
+        current_serial_port = port_name
+        if port_name:
+            last_good_port = port_name
+
+
+def _candidate_ports() -> list[str]:
+    preferred = []
+    if SERIAL_PORT:
+        preferred.append(SERIAL_PORT)
+    if last_good_port and last_good_port not in preferred:
+        preferred.append(last_good_port)
+
+    for p in scan_serial_ports():
+        if p not in preferred:
+            preferred.append(p)
+    return preferred
+
+
+def _touch_runtime_node(node_id: Any, packet: Optional[dict] = None) -> None:
+    if node_id in (None, ""):
+        return
+
+    node_key = str(node_id)
+    heard = now_ts()
+    rx_snr = None
+    rx_rssi = None
+
+    if isinstance(packet, dict):
+        heard = safe_int(packet.get("rxTime"), heard)
+        rx_snr = packet.get("rxSnr")
+        rx_rssi = packet.get("rxRssi")
+
+    with state_lock:
+        runtime = node_runtime.setdefault(node_key, {})
+        runtime["last_seen"] = heard
+        if rx_snr is not None:
+            runtime["rxSnr"] = rx_snr
+        if rx_rssi is not None:
+            runtime["rxRssi"] = rx_rssi
+
+
+def try_connect_port(port_name: str) -> bool:
     global iface, last_connect_ts
+    logging.info("Connecting to Meshtastic on %s", port_name)
+    new_iface = meshtastic.serial_interface.SerialInterface(devPath=port_name)
+    with state_lock:
+        iface = new_iface
+        last_connect_ts = now_ts()
+    _set_current_port(port_name)
+    set_error(None)
+    logging.info("Connected to Meshtastic on %s", port_name)
+    return True
+
+
+def auto_connect_interface() -> bool:
+    global iface
+    attempts = []
+
+    for port_name in _candidate_ports():
+        try:
+            return try_connect_port(port_name)
+        except Exception as exc:
+            attempts.append(f"{port_name}: {exc}")
+            logging.warning("Meshtastic connect failed on %s: %s", port_name, exc)
+            with state_lock:
+                iface = None
+
+    _set_current_port(None)
+    msg = "No usable Meshtastic serial port found"
+    if attempts:
+        msg += " | " + " | ".join(attempts)
+    set_error(msg)
+    logging.error(msg)
+    return False
+
+
+def connect_interface() -> bool:
+    global iface
 
     with state_lock:
         if iface is not None:
             return True
 
-        try:
-            logging.info("Connecting to Meshtastic on %s", SERIAL_PORT)
-            iface = meshtastic.serial_interface.SerialInterface(devPath=SERIAL_PORT)
-            last_connect_ts = now_ts()
-            set_error(None)
-            logging.info("Connected to Meshtastic on %s", SERIAL_PORT)
-            return True
-        except Exception as exc:
-            iface = None
-            set_error(str(exc))
-            logging.exception("Meshtastic connect failed: %s", exc)
-            return False
+    return auto_connect_interface()
 
 
 def disconnect_interface() -> None:
@@ -107,6 +203,7 @@ def disconnect_interface() -> None:
     with state_lock:
         current = iface
         iface = None
+    _set_current_port(None)
 
     if current is not None:
         try:
@@ -118,7 +215,7 @@ def disconnect_interface() -> None:
 def reconnect_interface() -> bool:
     disconnect_interface()
     time.sleep(0.5)
-    return connect_interface()
+    return auto_connect_interface()
 
 
 def ensure_connected() -> bool:
@@ -145,8 +242,32 @@ def normalize_node(node_num: Any, raw: dict) -> dict:
     short_name = user.get("shortName")
     name = long_name or short_name or f"Node {node_num}"
 
-    last_heard = safe_int(raw.get("lastHeard"))
-    online = bool(last_heard and (now_ts() - last_heard) <= NODE_ACTIVE_WINDOW_SEC)
+    runtime = node_runtime.get(str(node_num), {})
+    raw_last_heard = safe_int(raw.get("lastHeard"))
+    runtime_last_seen = safe_int(runtime.get("last_seen"))
+    last_heard = raw_last_heard or runtime_last_seen
+
+    signal = raw.get("rxRssi")
+    if signal is None:
+        signal = runtime.get("rxRssi")
+    if signal is None:
+        signal = raw.get("snr")
+    if signal is None:
+        signal = runtime.get("rxSnr")
+
+    rx_snr = raw.get("rxSnr")
+    if rx_snr is None:
+        rx_snr = runtime.get("rxSnr")
+
+    # Important: frontend greys out nodes when bridge sends online=False.
+    # Treat fresh runtime packets or any learned signal metrics as online,
+    # even if iface.nodes lastHeard is stale.
+    online = bool(
+        (last_heard and (now_ts() - last_heard) <= NODE_ACTIVE_WINDOW_SEC)
+        or signal is not None
+        or rx_snr is not None
+        or runtime_last_seen is not None
+    )
 
     return {
         "id": str(node_num),
@@ -159,8 +280,8 @@ def normalize_node(node_num: Any, raw: dict) -> dict:
         "altitude": safe_float(position.get("altitude")),
         "lastHeard": last_heard,
         "snr": raw.get("snr"),
-        "rxSnr": raw.get("rxSnr"),
-        "signal": raw.get("rxRssi") if raw.get("rxRssi") is not None else raw.get("snr"),
+        "rxSnr": rx_snr,
+        "signal": signal,
         "hopsAway": raw.get("hopsAway"),
         "batteryLevel": device_metrics.get("batteryLevel"),
         "online": online,
@@ -174,6 +295,19 @@ def get_nodes_payload() -> list:
 
     try:
         raw_nodes = getattr(current, "nodes", {}) or {}
+
+        # Update runtime cache from node table too, if available
+        for node_num, raw in raw_nodes.items():
+            heard = safe_int(raw.get("lastHeard"))
+            if heard:
+                with state_lock:
+                    runtime = node_runtime.setdefault(str(node_num), {})
+                    runtime["last_seen"] = heard
+                    if raw.get("rxSnr") is not None:
+                        runtime["rxSnr"] = raw.get("rxSnr")
+                    if raw.get("rxRssi") is not None:
+                        runtime["rxRssi"] = raw.get("rxRssi")
+
         nodes = [normalize_node(node_num, raw) for node_num, raw in raw_nodes.items()]
         nodes.sort(key=lambda n: (not n["online"], (n["name"] or "").lower()))
         return nodes
@@ -190,14 +324,19 @@ def on_receive(packet, **kwargs) -> None:
 
         decoded = packet.get("decoded", {}) or {}
         text = decoded.get("text")
+
+        from_id = packet.get("fromId") or packet.get("from")
+        to_id = packet.get("toId") or packet.get("to")
+
+        _touch_runtime_node(from_id, packet)
+        _touch_runtime_node(to_id, packet)
+
         if not text:
             return
 
         current = get_interface()
         nodes = getattr(current, "nodes", {}) if current is not None else {}
 
-        from_id = packet.get("fromId") or packet.get("from")
-        to_id = packet.get("toId") or packet.get("to")
         channel = packet.get("channel") or 0
         rx_time = safe_int(packet.get("rxTime"), now_ts())
 
@@ -292,7 +431,8 @@ def status():
             "last_error": last_error,
             "message_count": len(recent_messages),
             "node_count": len(nodes),
-            "port": SERIAL_PORT,
+            "port": current_serial_port or SERIAL_PORT,
+            "serial_candidates": scan_serial_ports(),
             "bridge_version": BRIDGE_VERSION,
             "meshtastic_version": MESHTASTIC_VERSION,
             "uptime_sec": now_ts() - start_ts,
@@ -402,7 +542,21 @@ def reconnect():
         "connected": ok,
         "last_error": last_error,
         "last_connect_ts": last_connect_ts,
-        "port": SERIAL_PORT,
+        "port": current_serial_port or SERIAL_PORT,
+        "serial_candidates": scan_serial_ports(),
+    }), (200 if ok else 502)
+
+
+@app.post("/rescan")
+def rescan():
+    ok = reconnect_interface()
+    return jsonify({
+        "ok": ok,
+        "connected": ok,
+        "last_error": last_error,
+        "last_connect_ts": last_connect_ts,
+        "port": current_serial_port or SERIAL_PORT,
+        "serial_candidates": scan_serial_ports(),
     }), (200 if ok else 502)
 
 
@@ -424,8 +578,9 @@ def root():
         "service": "GridDown Meshtastic Bridge",
         "bridge_version": BRIDGE_VERSION,
         "connected": is_connected(),
-        "port": SERIAL_PORT,
-        "endpoints": ["/status", "/nodes", "/messages", "/send", "/reconnect", "/health"],
+        "port": current_serial_port or SERIAL_PORT,
+        "serial_candidates": scan_serial_ports(),
+        "endpoints": ["/status", "/nodes", "/messages", "/send", "/reconnect", "/rescan", "/health"],
     })
 
 
